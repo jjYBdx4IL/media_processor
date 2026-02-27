@@ -180,11 +180,13 @@ class WorkerThread(threading.Thread):
                 cursor.execute("SELECT id, filepath FROM downloads WHERE status='upload_pending' LIMIT 1")
                 row = cursor.fetchone()
                 if row:
+                    if cfg.transfer_method == 'adb':
+                        dl_logic.start_adb_monitor(cfg)
+
                     id, filename = row
                     filepath = os.path.join(download_dir, filename) if filename else None
                     
                     if filepath and os.path.exists(filepath):
-                        logging.info(f"Uploading: {filepath}")
                         if dl_logic.upload_file(filepath):
                             cursor = conn.cursor()
                             cursor.execute("UPDATE downloads SET status=? WHERE id=?", ('uploaded', id))
@@ -196,6 +198,8 @@ class WorkerThread(threading.Thread):
                         cursor.execute("UPDATE downloads SET status=? WHERE id=?", ('missing', id))
                         conn.commit()
                         did_work = True
+                else:
+                    dl_logic.stop_adb_monitor()
 
                 if not did_work:
                     # 2. Normalization (Postprocessing Pending -> Upload Pending)

@@ -2,12 +2,13 @@ import os
 import tkinter as tk
 from tkinter import scrolledtext
 import sqlite3
+from media_processor import APPNAME
 import media_processor.common as common
 
 class LogsWindow:
     def __init__(self, root):
         self.window = tk.Toplevel(root)
-        self.window.title(f"{common.APPNAME} Logs")
+        self.window.title(f"{APPNAME} Logs")
         self.window.geometry("1240x700")
         self.window.lift()
         self.window.focus_force()

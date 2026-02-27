@@ -17,17 +17,20 @@ import shutil
 import logging
 import ctypes
 
+from media_processor import APP_GITHUB_ID, APP_VERSION, APPNAME
 import media_processor.common as common
 from media_processor.worker import WorkerThread
 from media_processor.gui_logs import LogsWindow
 from media_processor.gui_config import ConfigWindow
 from ui.github_update_checker import GithubUpdateChecker
 from ui.licenses_window import LicensesWindow
+import ui.tools
 
 root = None
 log_window = None
 config_window = None
 licenses_window = None
+last_clipboard_text = ""
 
 def init_db():
     os.makedirs(common.CFG_DIR_PATH, exist_ok=True)
@@ -53,9 +56,7 @@ def init_db():
     conn.close()
 
 def monitor_clipboard():
-    if not hasattr(monitor_clipboard, "last_text"):
-        monitor_clipboard.last_text = ""
-        logging.info("Clipboard monitor started.")
+    global last_clipboard_text
 
     text = ""
     try:
@@ -69,8 +70,8 @@ def monitor_clipboard():
         # Clipboard might be locked by another application
         pass
 
-    if text and text != monitor_clipboard.last_text:
-        monitor_clipboard.last_text = text
+    if text and text != last_clipboard_text:
+        last_clipboard_text = text
         if "youtube.com" in text or "youtu.be" in text:
             video_id = common.extract_video_id(text)
             if not video_id:
@@ -148,21 +149,28 @@ def show_licenses_window_callback():
     licenses_window = LicensesWindow(root)
 
 def main():
-    mutex = win32event.CreateMutex(None, False, f"Global\\{common.APPNAME}_Instance_Mutex") # type: ignore
+    mutex = win32event.CreateMutex(None, False, f"Global\\{APPNAME}_Instance_Mutex") # type: ignore
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         print("Another instance is already running.")
         return
 
     os.makedirs(common.LOG_DIR_PATH, exist_ok=True)
+    
+    log_level = logging.DEBUG if ui.tools.IS_DEBUGGER_PRESENT else logging.INFO
+    file_handler = logging.FileHandler(common.LOG_FILE_PATH, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format='%(asctime)s [%(thread)d]: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[
-            logging.FileHandler(common.LOG_FILE_PATH, encoding='utf-8'),
+            file_handler,
             logging.StreamHandler(sys.stdout)
         ]
     )
+
+    
 
     ensure_ffmpeg_available()
     
@@ -174,9 +182,6 @@ def main():
 
     logging.info("Program started.")
     
-    # Set callback for toast notifications to open logs
-    common.set_toast_callback(lambda: root.after(0, show_logs_window_callback))
-    
     stop_event = threading.Event()
 
     t_worker = WorkerThread(stop_event)
@@ -186,7 +191,10 @@ def main():
     root = tk.Tk()
     root.withdraw()
 
-    uc = GithubUpdateChecker(common.APP_GITHUB_ID, common.APPNAME, common.APP_VERSION, root=root)
+    # Set callback for toast notifications to open logs
+    common.set_toast_callback(lambda: root and root.after(0, show_logs_window_callback))
+
+    uc = GithubUpdateChecker(APP_GITHUB_ID, APPNAME, APP_VERSION, root=root)
     if common.get_config().update_check_enabled == '0':
         uc.stop()
 
@@ -224,11 +232,11 @@ def main():
                 winreg.CloseKey(key)
             except Exception as e:
                 logging.info(f"Failed to set Regedit LastKey: {e}")
-            win32api.ShellExecute(0, 'open', 'regedit.exe', None, None, 1)
+            win32api.ShellExecute(0, 'open', 'regedit.exe', None, None, 1) # type: ignore
         except Exception as e:
             common.show_toast(f"Error opening regedit: {e}", False)
 
-    icon = pystray.Icon(common.APPNAME, create_image(64, 64, 'red', 'white'), f"{common.APPNAME} {common.APP_VERSION}", menu=pystray.Menu(
+    icon = pystray.Icon(APPNAME, create_image(64, 64, 'red', 'white'), f"{APPNAME} {APP_VERSION}", menu=pystray.Menu(
         pystray.MenuItem("Show Logs", on_open_logs),
         pystray.MenuItem("Configuration", on_open_config),
         pystray.MenuItem("Licenses", on_open_licenses),

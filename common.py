@@ -10,9 +10,7 @@ from ctypes import wintypes
 from pathlib import Path
 from windows_toasts import WindowsToaster, Toast
 
-APPNAME = "media_processor"
-APP_GITHUB_ID = "jjYBdx4IL/media_processor"
-APP_VERSION = "0.8.0.0"
+from media_processor import APPNAME
 
 LAPPDATA_PATH = Path(os.environ.get('LOCALAPPDATA', os.path.join(os.path.expanduser('~'), 'AppData', 'Local')))
 LOG_DIR_PATH = LAPPDATA_PATH / 'log'
@@ -45,7 +43,8 @@ def show_toast(message, success=True):
         msg = f"❌ {message}" if not success else f"✅ {message}"
         newToast.text_fields = [msg]
         if _toast_callback:
-            newToast.on_activated = lambda _: _toast_callback()
+            cb = _toast_callback
+            newToast.on_activated = lambda _: cb()
         wintoaster.show_toast(newToast)
     except Exception as e:
         print(f"Toast error: {e}")
@@ -123,6 +122,9 @@ class Config:
         self.scp_user = ''
         self.scp_key_file = ''
         self.scp_remote_path = '/'
+        self.adb_fallback_enabled = '0'
+        self.adb_tools_path = ''
+        self.adb_remote_path = '/sdcard/Download/'
         self.local_target_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
         self.update_check_enabled = '1'
         self.download_dir = DEFAULT_DOWNLOAD_DIR

@@ -30,4 +30,4 @@ It fetches its work from two sources: a directory and the system clipboard.
 
 
 --
-git@nas:py.git@27efda776623aae108865efa6e0a5b8cf91cc075
+git@nas:py.git@0db2111bb0745fd7150ce271360ef9df59614468

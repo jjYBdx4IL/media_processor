@@ -1,7 +1,11 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import os
+import sys
+import re
 import ftplib
 import subprocess
+from media_processor import APP_VERSION, APPNAME
 import media_processor.common as common
 from ui.github_update_checker import GithubUpdateChecker
 from ui.tools import Tools
@@ -10,7 +14,7 @@ from ui.tools import Tools
 class ConfigWindow:
     def __init__(self, root):
         self.window = tk.Toplevel(root)
-        self.window.title(f"{common.APPNAME} {common.APP_VERSION} - Configuration")
+        self.window.title(f"{APPNAME} {APP_VERSION} - Configuration")
 
         # Scrollable container
         main_frame = tk.Frame(self.window)
@@ -124,6 +128,9 @@ class ConfigWindow:
 
         rb_local = tk.Radiobutton(lf_method, text="Local Folder", variable=self.var_method, value='local')
         rb_local.pack(side='left', padx=10, pady=5)
+
+        rb_adb = tk.Radiobutton(lf_method, text="ADB", variable=self.var_method, value='adb')
+        rb_adb.pack(side='left', padx=10, pady=5)
 
         # Local Settings
         lf_local = tk.LabelFrame(scrollable_frame, text="Local Output Folder")
@@ -258,6 +265,85 @@ class ConfigWindow:
         tk.Button(lf_scp, text="Test Connection", command=test_scp).grid(row=4, column=1, sticky='w', padx=5, pady=5)
         lf_scp.columnconfigure(1, weight=1)
 
+        # ADB Fallback
+        lf_adb = tk.LabelFrame(scrollable_frame, text="ADB Transfer")
+        lf_adb.pack(fill='x', padx=10, pady=10)
+        
+        self.var_adb_enabled = tk.BooleanVar(value=cfg.adb_fallback_enabled == '1')
+        chk_adb = tk.Checkbutton(lf_adb, text="Enable ADB Fallback (if other methods fail)", variable=self.var_adb_enabled)
+        chk_adb.grid(row=0, column=0, columnspan=3, sticky='w', padx=5, pady=5)
+        
+        tk.Label(lf_adb, text="Tools Path:").grid(row=2, column=0, sticky='e', padx=5, pady=2)
+        self.var_adb_path = tk.StringVar(value=cfg.adb_tools_path)
+        ent_adb_path = tk.Entry(lf_adb, textvariable=self.var_adb_path)
+        ent_adb_path.grid(row=2, column=1, sticky='ew', padx=5, pady=2)
+        
+        def browse_adb():
+            d = filedialog.askdirectory(initialdir=self.var_adb_path.get())
+            if d:
+                self.var_adb_path.set(d)
+        
+        tk.Button(lf_adb, text="...", command=browse_adb, width=3).grid(row=2, column=2, sticky='w', padx=5, pady=2)
+        
+        tk.Label(lf_adb, text="Remote Path:").grid(row=3, column=0, sticky='e', padx=5, pady=2)
+        self.var_adb_remote = tk.StringVar(value=cfg.adb_remote_path)
+        ent_adb_remote = tk.Entry(lf_adb, textvariable=self.var_adb_remote)
+        ent_adb_remote.grid(row=3, column=1, columnspan=2, sticky='ew', padx=5, pady=2)
+        
+        def test_adb():
+            adb_exe = "adb"
+            tools_path = self.var_adb_path.get()
+            if tools_path:
+                adb_exe = os.path.join(tools_path, "adb")
+            
+            remote_path = self.var_adb_remote.get()
+            if not remote_path:
+                remote_path = "/sdcard/Download/"
+            
+            startupinfo = None
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            except AttributeError:
+                pass
+
+            if sys.platform == 'win32':
+                try:
+                    proc_ver = subprocess.run([adb_exe, "--version"], capture_output=True, text=True, startupinfo=startupinfo)
+                    if re.search(r"36\.0\.1(?!\d)", proc_ver.stdout):
+                         messagebox.showwarning("ADB Warning", "ADB version 36.0.1 detected.\nThis version is known to be buggy on Windows.\nPlease update your platform-tools.")
+                except Exception:
+                    pass
+
+            device_serial = None
+            try:
+                proc = subprocess.run([adb_exe, "devices"], capture_output=True, text=True, startupinfo=startupinfo)
+                for line in proc.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == 'device':
+                        if not parts[0].startswith("emulator-"):
+                            device_serial = parts[0]
+                            break
+            except Exception:
+                pass
+
+            cmd = [adb_exe]
+            if device_serial:
+                cmd.extend(["-s", device_serial])
+            cmd.extend(["shell", f"cd \"{remote_path}\""])
+            
+            try:
+                subprocess.run(cmd, check=True, startupinfo=startupinfo, capture_output=True, text=True)
+                messagebox.showinfo("Success", f"ADB connection successful.\nDirectory '{remote_path}' exists.")
+            except subprocess.CalledProcessError as e:
+                messagebox.showerror("Error", f"ADB connection failed:\n{e.stderr}")
+            except Exception as e:
+                messagebox.showerror("Error", f"ADB connection failed: {e}")
+
+        tk.Button(lf_adb, text="Test Connection", command=test_adb).grid(row=4, column=1, sticky='w', padx=5, pady=5)
+        
+        lf_adb.columnconfigure(1, weight=1)
+
         update_pp_state()
 
         # Buttons Frame
@@ -267,7 +353,7 @@ class ConfigWindow:
         tk.Button(btn_frame, text="Save", command=self.on_save, width=10).pack(side='right', padx=5)
         tk.Button(btn_frame, text="Cancel", command=self.window.destroy, width=10).pack(side='right', padx=5)
 
-        Tools.center_window(self.window, 500, 800)
+        Tools.center_window(self.window, 600, 800)
 
 
     def on_save(self):
@@ -298,6 +384,9 @@ class ConfigWindow:
         cfg.scp_key_file = self.var_scp_key.get()
         cfg.scp_remote_path = self.var_scp_path.get()
         cfg.local_target_dir = self.var_local_path.get()
+        cfg.adb_fallback_enabled = '1' if self.var_adb_enabled.get() else '0'
+        cfg.adb_tools_path = self.var_adb_path.get()
+        cfg.adb_remote_path = self.var_adb_remote.get()
         
         cfg.save()
         

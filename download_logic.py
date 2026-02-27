@@ -7,17 +7,244 @@ import logging
 import shutil
 import ftplib
 import re
+import asyncio
 import yt_dlp
 from bs4 import BeautifulSoup
+from urllib.parse import quote
 import pyttsx3
+import adbutils
+from adbutils import adb
 import media_processor.common as common
+
+_adb_monitor = None
+
+class AdbDeviceMonitor:
+    def __init__(self, adb_path=None):
+        if adb_path and os.path.exists(adb_path):
+            adbutils.adb_path = adb_path
+        self.current_device = None
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.waiting_logged = False
+        self.loop = None
+        self.async_stop_event = None
+
+    def start(self):
+        self.stop_event.clear()
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        if not self.thread:
+            return
+        self.stop_event.set()
+        if self.loop and self.async_stop_event:
+            self.loop.call_soon_threadsafe(self.async_stop_event.set)
+        self.current_device = None
+
+    def _run(self):
+        logging.debug("ADB Monitor thread started")
+        try:
+            asyncio.run(self._run_async())
+        except Exception as e:
+            logging.info(f"ADB Monitor thread error: {e}")
+            self.current_device = None
+        logging.debug("ADB Monitor thread terminated")
+
+    async def _run_async(self):
+        self.loop = asyncio.get_running_loop()
+        self.async_stop_event = asyncio.Event()
+        
+        if self.stop_event.is_set():
+            return
+
+        writer = None
+        try:
+            try:
+                adb.server_version()
+            except Exception:
+                pass
+
+            reader, writer = await asyncio.open_connection(adb.host, adb.port)
+            
+            cmd = "host:track-devices"
+            msg = "{:04x}{}".format(len(cmd), cmd).encode("utf-8")
+            writer.write(msg)
+            await writer.drain()
+            
+            try:
+                okay = await asyncio.wait_for(reader.readexactly(4), timeout=20.0)
+            except asyncio.TimeoutError:
+                logging.error("ADB track-devices handshake timed out")
+                return
+
+            if okay != b"OKAY":
+                logging.error(f"ADB track-devices failed: {okay}")
+                return
+
+            while not self.async_stop_event.is_set():
+                read_len_task = asyncio.create_task(reader.readexactly(4))
+                stop_task = asyncio.create_task(self.async_stop_event.wait())
+                
+                done, pending = await asyncio.wait(
+                    [read_len_task, stop_task], 
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                for t in pending:
+                    t.cancel()
+
+                if stop_task in done:
+                    break
+                
+                len_bytes = read_len_task.result()
+                length = int(len_bytes.decode("utf-8"), 16)
+                
+                read_payload_task = asyncio.create_task(reader.readexactly(length))
+                stop_task = asyncio.create_task(self.async_stop_event.wait())
+                
+                done, pending = await asyncio.wait(
+                    [read_payload_task, stop_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                for t in pending:
+                    t.cancel()
+
+                if stop_task in done:
+                    break
+                
+                payload = read_payload_task.result()
+                self._process_device_list(payload.decode("utf-8"))
+                
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            if not self.async_stop_event.is_set():
+                logging.info(f"ADB Monitor loop error: {e}")
+        finally:
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    def _process_device_list(self, output):
+        for line in output.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                serial, state = parts[0], parts[1]
+                if not serial.startswith('emulator-'):
+                    if state == 'device':
+                        if self.current_device != serial:
+                            logging.info(f"ADB device connected: {serial}")
+                            self.current_device = serial
+                    else:
+                        if self.current_device != None:
+                            logging.info(f"ADB device disconnected: {self.current_device}")
+                            self.current_device = None
+
+    def get_device(self):
+        return self.current_device
+    
+    def report_failure(self, serial):
+        if self.current_device == serial:
+            self.current_device = None
+
+def start_adb_monitor(cfg):
+    global _adb_monitor
+    adb_exe = None
+    if cfg.adb_tools_path:
+        adb_exe = os.path.join(cfg.adb_tools_path, "adb.exe" if sys.platform == 'win32' else "adb")
+    
+    if _adb_monitor is None:
+        _adb_monitor = AdbDeviceMonitor(adb_exe)
+    
+    _adb_monitor.start()
+
+def stop_adb_monitor():
+    global _adb_monitor
+    if _adb_monitor:
+        _adb_monitor.stop()
+        _adb_monitor = None
+
+def try_adb_push(file_path, cfg):
+    if cfg.adb_tools_path:
+        adb_exe = os.path.join(cfg.adb_tools_path, "adb.exe" if sys.platform == 'win32' else "adb")
+        if os.path.exists(adb_exe):
+            adbutils.adb_path = adb_exe
+        
+    remote_path = cfg.adb_remote_path
+    if not remote_path:
+        remote_path = "/sdcard/Download/"
+        
+    filename = os.path.basename(file_path)
+
+    device_serial = None
+    
+    if _adb_monitor:
+        device_serial = _adb_monitor.get_device()
+        if not device_serial:
+            if not _adb_monitor.waiting_logged:
+                logging.info(f"Uploading: {file_path}")
+                logging.info("Attempting ADB push...")
+                logging.info("ADB Monitor active but no device detected yet.")
+                _adb_monitor.waiting_logged = True
+            return False
+        _adb_monitor.waiting_logged = False
+    
+    logging.info(f"Uploading: {file_path}")
+    logging.info("Attempting ADB push...")
+
+    if not device_serial:
+        logging.info("No ADB device found.")
+        return False
+
+    logging.info(f"Using ADB device: {device_serial}")
+    
+    try:
+        device = adb.device(serial=device_serial)
+        file_size = os.path.getsize(file_path)
+        start_time = time.time()
+        
+        final_remote_path = remote_path
+        if not final_remote_path.endswith('/') and not os.path.splitext(final_remote_path)[1]:
+             final_remote_path += "/"
+        if final_remote_path.endswith('/'):
+            final_remote_path = final_remote_path + filename
+            
+        device.sync.push(file_path, final_remote_path)
+        
+        duration = time.time() - start_time
+        speed = (file_size / (1024 * 1024)) / duration if duration > 0 else 0
+        logging.info(f"Successfully uploaded {file_path} via ADB. ({file_size / (1024*1024):.2f} MB, {speed:.2f} MB/s)")
+        
+        # Trigger media scan
+        uri = f"file://{quote(final_remote_path, safe='/')}"
+        device.shell(f"am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d {uri}")
+        
+        logging.info(f"Triggered media scan for {final_remote_path}")
+
+        common.show_toast(f"Uploaded via ADB: {filename}")
+        os.remove(file_path)
+        return True
+    except Exception as e:
+        logging.info(f"ADB push failed: {e}")
+        if _adb_monitor and device_serial:
+            _adb_monitor.report_failure(device_serial)
+        return False
 
 def upload_file(file_path):
     cfg = common.get_config()
+
     method = cfg.transfer_method
     
     if method == 'local':
         try:
+            logging.info(f"Uploading (Local move): {file_path}")
             target_dir = cfg.local_target_dir
             if not target_dir:
                 target_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
@@ -41,8 +268,12 @@ def upload_file(file_path):
             common.show_toast(f"Move Error: {e}", False)
             return False
 
+    if method == 'adb':
+        return try_adb_push(file_path, cfg)
+
     if method == 'scp':
         try:
+            logging.info(f"Uploading (SCP): {file_path}")
             server = cfg.scp_server
             port = cfg.scp_port
             user = cfg.scp_user
@@ -91,14 +322,19 @@ def upload_file(file_path):
             logging.info(f"Error uploading via SCP: {e}")
             if e.stderr:
                 logging.info(f"SCP stderr: {e.stderr}")
+            if cfg.adb_fallback_enabled == '1' and try_adb_push(file_path, cfg):
+                return True
             common.show_toast(f"SCP Error: {e}", False)
             return False
         except Exception as e:
             logging.info(f"Error uploading via SCP: {e}")
+            if cfg.adb_fallback_enabled == '1' and try_adb_push(file_path, cfg):
+                return True
             common.show_toast(f"SCP Error: {e}", False)
             return False
     else:
         try:
+            logging.info(f"Uploading (FTP): {file_path}")
             ftp = ftplib.FTP()
             ftp.connect(cfg.ftp_server, int(cfg.ftp_port)) # type: ignore
             ftp.login(cfg.ftp_user, cfg.ftp_pass) # type: ignore
@@ -120,6 +356,8 @@ def upload_file(file_path):
             return True
         except Exception as e:
             logging.info(f"Error uploading to FTP: {e}")
+            if cfg.adb_fallback_enabled == '1' and try_adb_push(file_path, cfg):
+                return True
             common.show_toast(f"FTP Error: {e}", False)
             return False
 
